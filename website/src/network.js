@@ -90,7 +90,7 @@ export class NetworkManager {
         Object.values(this.socketIds).forEach((sid) => {
           if (sid !== this.socket.id && !this.peers[sid]) {
             console.log(`🆕 New player detected in room-update, connecting to ${sid}`);
-            this.createPeerConnection(sid, true);
+            this.createPeerConnection(sid);
           }
         });
       }
@@ -166,57 +166,66 @@ export class NetworkManager {
 
     this.socket.on("voice-signal", async ({ fromSocketId, signal }) => {
       if (!fromSocketId || fromSocketId === this.socket.id) return;
-      
-      // If we receive a signal and don't have a peer, create one as non-initiator
-      if (!this.peers[fromSocketId]) {
-        console.log(`📞 Signaling received from new peer ${fromSocketId}, creating connection`);
-        this.createPeerConnection(fromSocketId, false);
+
+      const pc = this.peers[fromSocketId];
+      if (!pc) {
+        // Only create if we receive an offer or if we are the "impolite" peer
+        // However, with Perfect Negotiation, we can just create it on first signal
+        console.log(`📞 Signaling received from ${fromSocketId}, creating connection`);
+        this.createPeerConnection(fromSocketId);
       }
       
-      const pc = this.peers[fromSocketId];
-      if (!pc) return;
+      const peer = this.peers[fromSocketId];
+      if (!peer) return;
 
       try {
         if (signal.type === "offer") {
+          const polite = this.socket.id < fromSocketId;
+          const offerCollision = peer.makingOffer || peer.signalingState !== "stable";
+
+          peer.ignoreOffer = !polite && offerCollision;
+          if (peer.ignoreOffer) {
+            console.log(`⛔ Glare: Ignoring offer from ${fromSocketId} (we are impolite)`);
+            return;
+          }
+
           console.log(`📡 Received offer from ${fromSocketId}`);
-          await pc.setRemoteDescription(new RTCSessionDescription(signal));
-          const answer = await pc.createAnswer();
-          await pc.setLocalDescription(answer);
+          await peer.setRemoteDescription(new RTCSessionDescription(signal));
+          const answer = await peer.createAnswer();
+          await peer.setLocalDescription(answer);
           this.socket.emit("voice-signal", {
             roomId: this.roomId,
             toSocketId: fromSocketId,
-            signal: answer,
+            signal: peer.localDescription,
           });
 
           // Process buffered candidates
           if (this.pendingCandidates[fromSocketId]) {
-            console.log(`❄️ Processing ${this.pendingCandidates[fromSocketId].length} buffered candidates for ${fromSocketId}`);
             for (const cand of this.pendingCandidates[fromSocketId]) {
-              await pc.addIceCandidate(new RTCIceCandidate(cand)).catch(e => console.warn("Buffered ICE error:", e));
+              await peer.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
             }
             delete this.pendingCandidates[fromSocketId];
           }
         } else if (signal.type === "answer") {
           console.log(`📡 Received answer from ${fromSocketId}`);
-          await pc.setRemoteDescription(new RTCSessionDescription(signal));
+          await peer.setRemoteDescription(new RTCSessionDescription(signal));
           
-          // Process buffered candidates
           if (this.pendingCandidates[fromSocketId]) {
-            console.log(`❄️ Processing ${this.pendingCandidates[fromSocketId].length} buffered candidates for ${fromSocketId}`);
             for (const cand of this.pendingCandidates[fromSocketId]) {
-              await pc.addIceCandidate(new RTCIceCandidate(cand)).catch(e => console.warn("Buffered ICE error:", e));
+              await peer.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
             }
             delete this.pendingCandidates[fromSocketId];
           }
-        } else if (signal.candidate || signal.sdpMid !== undefined) {
-          if (pc.remoteDescription && pc.remoteDescription.type) {
-            await pc.addIceCandidate(new RTCIceCandidate(signal)).catch(e => {
-              if (e.name !== "OperationError") console.warn("ICE candidate error:", e);
-            });
-          } else {
-            if (!this.pendingCandidates[fromSocketId]) this.pendingCandidates[fromSocketId] = [];
-            this.pendingCandidates[fromSocketId].push(signal);
-            console.log(`❄️ Buffered candidate from ${fromSocketId}`);
+        } else if (signal.candidate) {
+          try {
+            if (peer.remoteDescription && peer.remoteDescription.type) {
+              await peer.addIceCandidate(new RTCIceCandidate(signal));
+            } else {
+              if (!this.pendingCandidates[fromSocketId]) this.pendingCandidates[fromSocketId] = [];
+              this.pendingCandidates[fromSocketId].push(signal);
+            }
+          } catch (err) {
+            if (!peer.ignoreOffer) console.warn("ICE candidate error:", err);
           }
         }
       } catch (e) {
@@ -283,7 +292,7 @@ export class NetworkManager {
       });
     }
     this.clearStoredSession();
-    
+
     // Cleanup all peer connections
     Object.keys(this.peers).forEach(sid => this.cleanupPeerConnection(sid));
   }
@@ -434,11 +443,10 @@ export class NetworkManager {
 
         this.localStream = await navigator.mediaDevices.getUserMedia({
           audio: {
-            echoCancellation: { ideal: true },
-            noiseSuppression: { ideal: true },
-            autoGainControl: { ideal: true },
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
             channelCount: 1,
-            latency: 0,
           },
         });
 
@@ -446,7 +454,7 @@ export class NetworkManager {
         this.localStream.getAudioTracks().forEach((track) => {
           console.log("🎤 Local track:", track.label, "state:", track.readyState);
           track.enabled = true;
-          
+
           // Handle track ended unexpectedly
           track.onended = () => {
             console.warn("🎤 Local track ended unexpectedly");
@@ -460,7 +468,7 @@ export class NetworkManager {
 
         this.isMicOn = true;
         this.broadcastVoiceStatus();
-        
+
         // Add tracks to existing peer connections
         this.addLocalTracksToPeers();
 
@@ -468,7 +476,7 @@ export class NetworkManager {
         Object.values(this.socketIds).forEach((sid) => {
           if (sid !== this.socket.id && !this.peers[sid]) {
             console.log(`🎤 Mic ON: Initiating connection to existing peer ${sid}`);
-            this.createPeerConnection(sid, true);
+            this.createPeerConnection(sid);
           }
         });
 
@@ -535,8 +543,7 @@ export class NetworkManager {
       (color !== undefined && this.mutedPlayerColors.has(color));
 
     audio.muted = muted;
-    // Lowered volume to 0.6 to prevent speaker feedback loop
-    audio.volume = muted ? 0 : 0.6; 
+    audio.volume = muted ? 0 : 1.0; 
 
     if (audio.srcObject) {
       audio.srcObject.getAudioTracks().forEach((track) => {
@@ -564,7 +571,7 @@ export class NetworkManager {
       try {
         const senders = pc.getSenders();
         const audioSender = senders.find((s) => s.track && s.track.kind === "audio");
-        
+
         if (audioSender) {
           console.log("🔄 Replacing audio track for", socketId);
           audioSender.replaceTrack(localTrack).catch(e => {
@@ -581,44 +588,34 @@ export class NetworkManager {
     });
   }
 
-  createPeerConnection(targetSocketId, isInitiator) {
-    if (this.peers[targetSocketId]) {
-      console.warn("Peer already exists, skipping:", targetSocketId);
-      return;
-    }
-
+  createPeerConnection(targetSocketId) {
+    if (this.peers[targetSocketId]) return;
     if (targetSocketId === this.socket.id) return;
 
-    console.log(`🤝 Creating PeerConnection for ${targetSocketId} (initiator: ${isInitiator})`);
+    console.log(`🤝 Creating PeerConnection for ${targetSocketId}`);
 
     const pc = new RTCPeerConnection({
-      iceServers: [
-        { urls: "stun:stun.l.google.com:19302" },
-        { urls: "stun:stun1.l.google.com:19302" },
-        { urls: "stun:stun2.l.google.com:19302" },
-        { urls: "stun:stun3.l.google.com:19302" },
-        { urls: "stun:stun4.l.google.com:19302" },
-        { urls: "stun:stun.services.mozilla.com" },
-        { urls: "stun:stun.xten.com" },
-      ],
-      iceTransportPolicy: "all",
-      iceCandidatePoolSize: 10,
+      iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
     });
+
+    pc.makingOffer = false;
+    pc.ignoreOffer = false;
+
     this.peers[targetSocketId] = pc;
 
-    // ✅ NEGOTIATION NEEDED: Crucial for adding tracks later
     pc.onnegotiationneeded = async () => {
       try {
-        console.log(`🔄 Negotiation needed for ${targetSocketId}`);
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
+        pc.makingOffer = true;
+        await pc.setLocalDescription();
         this.socket.emit("voice-signal", {
           roomId: this.roomId,
           toSocketId: targetSocketId,
           signal: pc.localDescription,
         });
-      } catch (e) {
-        console.error("Negotiation error:", e);
+      } catch (err) {
+        console.error("Negotiation error:", err);
+      } finally {
+        pc.makingOffer = false;
       }
     };
 
@@ -640,11 +637,11 @@ export class NetworkManager {
       
       let audio = this.remoteAudioEls[targetSocketId];
       if (!audio) {
-        audio = new Audio();
+        audio = document.createElement("audio");
         audio.autoplay = true;
         audio.playsInline = true;
-        audio.setAttribute("playsinline", "");
-        audio.setAttribute("webkit-playsinline", "");
+        audio.style.display = "none";
+        document.body.appendChild(audio); // CRITICAL for AEC
         this.remoteAudioEls[targetSocketId] = audio;
       }
 
@@ -656,22 +653,11 @@ export class NetworkManager {
     };
 
     pc.oniceconnectionstatechange = () => {
-      console.log(`❄️ ICE [${targetSocketId}]: ${pc.iceConnectionState}`);
-      if (pc.iceConnectionState === "failed" || pc.iceConnectionState === "disconnected") {
-        console.warn("⚠️ ICE Connection lost/failed. Attempting to recover...");
-        pc.restartIce().catch(e => console.error("❌ ICE Restart failed:", e));
+      if (pc.iceConnectionState === "failed") {
+        pc.restartIce().catch(() => {});
       }
     };
 
-    pc.onconnectionstatechange = () => {
-      console.log(`🤝 PeerConnection [${targetSocketId}]: ${pc.connectionState}`);
-      if (pc.connectionState === "failed") {
-        console.warn("❌ PeerConnection failed, cleaning up...");
-        this.cleanupPeerConnection(targetSocketId);
-      }
-    };
-
-    // Add local tracks if we have them
     if (this.localStream) {
       this.localStream.getAudioTracks().forEach((track) => {
         pc.addTrack(track, this.localStream);
@@ -679,24 +665,13 @@ export class NetworkManager {
     }
 
     // Data Channel
-    if (isInitiator) {
-      const dc = pc.createDataChannel("chat", { negotiated: false });
-      this.setupDataChannel(targetSocketId, dc);
-    } else {
-      pc.ondatachannel = (event) => {
-        this.setupDataChannel(targetSocketId, event.channel);
-      };
-    }
+    pc.ondatachannel = (event) => {
+      this.setupDataChannel(targetSocketId, event.channel);
+    };
 
-    // Only create manual offer if we are initiator and didn't trigger negotiationneeded yet
-    if (isInitiator) {
-      setTimeout(() => {
-        if (pc.signalingState === "stable") {
-          console.log(`📡 Manual negotiation trigger for ${targetSocketId}`);
-          pc.onnegotiationneeded();
-        }
-      }, 100);
-    }
+    // We create the channel as well to ensure it exists
+    const dc = pc.createDataChannel("chat");
+    this.setupDataChannel(targetSocketId, dc);
   }
 
   setupDataChannel(sid, dc) {
