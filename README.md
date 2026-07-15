@@ -170,26 +170,6 @@ docker run -p 3000:3000 ludo-yaar
 
 ---
 
-## 📁 Project Structure
-
-```
-ludo/
-│
-├── server/              # Node.js backend
-│   ├── server.js        # Express + Socket.io entry point
-│   └── gameLogic.js     # Core game engine
-│
-├── website/             # Vite frontend
-│   ├── index.html
-│   ├── style.css
-│   └── src/             # JavaScript modules
-│
-├── Dockerfile
-├── railway.toml
-├── .dockerignore
-└── package.json         # Root install & build scripts
-```
-
 ---
 
 ## 📄 License
